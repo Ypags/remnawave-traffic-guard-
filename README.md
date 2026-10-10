@@ -5,14 +5,46 @@
 скользящее окно времени (по умолчанию **100 ГБ за час**; лимит и окно
 настраиваются).
 
-Работает отдельным процессом или контейнером: обращается к панели только по
-HTTP API, не зависит от других сервисов и не трогает их код и БД.
+Работает отдельным контейнером: обращается к панели только по HTTP API, не
+зависит от других сервисов и не трогает их код и БД.
 
-Пути API и формат ответов сверены с исходниками `remnawave/backend` (ветка
-`main`, на момент написания — версия **3.4.5**): `libs/contract/api/routes.ts`,
-`libs/contract/models/extended-users.schema.ts`,
-`libs/contract/models/user-traffic.schema.ts`. Если вы используете панель
-другой major-версии — проверьте по тем же файлам, что пути не изменились.
+## Быстрый старт
+
+1. В панели Remnawave создайте API-токен (**Settings → API Tokens**) со
+   scope `users`: **Read** + **Write**. Не используйте Admin JWT.
+2. На сервере:
+
+```bash
+git clone https://github.com/Ypags/remnawave-traffic-guard-.git remnawave-traffic-guard
+cd remnawave-traffic-guard
+cp .env.example .env
+nano .env
+```
+
+Заполните минимум:
+
+```env
+REMNAWAVE_URL=https://panel.example.com
+REMNAWAVE_API_TOKEN=ваш_токен
+```
+
+Если панель за Cloudflare Access — добавьте `CF_CLIENT_ID` /
+`CF_CLIENT_SECRET`. Для алертов в Telegram — `TELEGRAM_BOT_TOKEN` и
+`TELEGRAM_CHAT_ID`.
+
+3. Запуск:
+
+```bash
+docker compose up -d --build
+docker compose logs -f remnawave-traffic-guard
+```
+
+Ожидайте строку `Прогон завершён` с ненулевым `scannedTotal` — значит панель
+доступна и токен рабочий. Полный час истории набирается не сразу: пока не
+наберётся окно `WINDOW_MINUTES`, кандидатов на отключение почти не будет —
+это нормально.
+
+---
 
 ## Как это работает
 
@@ -20,108 +52,62 @@ HTTP API, не зависит от других сервисов и не тро�
    пользователей через `GET /api/users` (постранично, без фильтров — панель
    сама предупреждает в Swagger, что фильтры там на `LIKE` и дорогие).
 2. У каждого пользователя берётся `userTraffic.lifetimeUsedTrafficBytes` —
-   это накопительный счётчик **за всё время**, который не затрагивается
+   накопительный счётчик **за всё время**, который не затрагивается
    периодическим сбросом по `trafficLimitStrategy` (в отличие от
-   `userTraffic.usedTrafficBytes`, который сбрасывается). Именно поэтому для
-   расчёта скользящего окна используется он.
+   `userTraffic.usedTrafficBytes`). Именно поэтому для скользящего окна
+   используется он.
 3. Каждое значение складывается в локальную историю на диске
-   (`data/state.json`) с таймстампом. Храним только то, что нужно: все точки
-   внутри окна + одна точка "до" окна (якорь) — остальное не копится, так что
-   файл не растёт бесконечно даже на тысячах пользователей.
+   (`data/state.json`) с таймстампом. Храним только точки внутри окна + одну
+   точку «до» окна (якорь) — файл не растёт бесконечно.
 4. Прирост = `последнее_значение − значение_на_начало_окна`. Если прирост
    `>= TRAFFIC_LIMIT_GB`, пользователь — кандидат на отключение.
 5. **Предохранитель**: если кандидатов за один проход больше
    `CIRCUIT_BREAKER_MAX_USERS` **или** больше `CIRCUIT_BREAKER_MAX_PERCENT`%
-   от просканированных активных пользователей — никого не отключаем, пишем в
-   лог и шлём алерт в Telegram ("вероятно, что-то сломалось": сброс счётчиков
-   в панели, баг правила, аномалия у всех сразу и т.п.).
-6. Если предохранитель не сработал — отключаем кандидатов через
-   `POST /api/users/{id}/actions/disable` и шлём один сводный алерт в Telegram.
-7. Все действия (отключение/срабатывание предохранителя/ручной возврат)
-   пишутся в `data/actions.jsonl` — построчный JSON-журнал для аудита.
-8. История окна лежит на диске и переживает перезапуск контейнера/процесса.
+   от активных — никого не отключаем, пишем в лог и шлём алерт в Telegram.
+6. Иначе отключаем кандидатов через
+   `POST /api/users/{id}/actions/disable` и шлём сводный алерт.
+7. Все действия пишутся в `data/actions.jsonl` (аудит).
+8. История окна лежит на диске и переживает перезапуск контейнера.
 
-## Структура проекта
+Пути API сверены с `remnawave/backend` (версия **3.4.5**). На другой
+major-версии панели проверьте, что маршруты не изменились.
 
-```
-src/
-  config.ts          — чтение и валидация .env
-  env.ts             — мини-загрузчик .env (без зависимости от dotenv)
-  remnawaveClient.ts — HTTP-клиент панели (fetch, без axios)
-  stateStore.ts       — скользящее окно на диске
-  trafficGuard.ts     — основной цикл: опрос → расчёт → предохранитель → действие
-  telegramNotifier.ts — алерты напрямую в Telegram Bot API
-  actionsLog.ts       — JSONL-журнал действий
-  tools/unblockUser.ts — CLI для возврата пользователя
-  index.ts            — точка входа, планировщик, graceful shutdown
-```
+## Переменные окружения
 
-Зависимости: **0 runtime** (используется встроенный в Node 20 `fetch`), в
-dev — только `typescript` и `@types/node`.
-
-## 1. Создание API-токена в Remnawave
-
-Отдельный `REMNAWAVE_API_TOKEN` для этого сервиса — **не** используйте
-Admin JWT и не переиспользуйте токены других сервисов, чтобы в случае
-утечки/компрометации область действий была минимальной.
-
-1. Зайдите в веб-панель Remnawave под админом.
-2. Откройте **Settings → карточка "API Tokens"**.
-3. **Create** → укажите имя (например `remnawave-traffic-guard`).
-4. **Expiration (days)** — минимум 1 день, "бессрочных" токенов в Remnawave
-   нет. Поставьте большой срок (например `365`) и держите в курсе, что токен
-   придётся пересоздать до истечения — иначе сервис начнёт получать `401` и
-   перестанет видеть новых кандидатов (но не упадёт, просто будет писать
-   ошибку в лог каждый цикл).
-5. В списке ресурсов (scopes) найдите **`users`** и включите **Read** и
-   **Write** (нужны: Read — для списка пользователей и трафика, Write — для
-   `actions/disable` и `actions/enable`). Больше ничего не включайте.
-6. Скопируйте значение токена — панель показывает его **один раз**.
-7. Если панель закрыта Cloudflare Zero Trust Access — заведите Service Token
-   в Cloudflare Dashboard → Zero Trust → Access → Service Tokens и впишите
-   в `CF_CLIENT_ID` / `CF_CLIENT_SECRET`.
-
-## 2. Настройка .env
-
-```bash
-cp .env.example .env
-```
-
-Ключевые переменные (полный список с комментариями — в `.env.example`):
+Полный список с комментариями — в `.env.example`.
 
 | Переменная | По умолчанию | Что это |
 |---|---|---|
 | `REMNAWAVE_URL` | — | URL панели, например `https://panel.example.com` |
-| `REMNAWAVE_API_TOKEN` | — | токен из шага 1 |
-| `CF_CLIENT_ID`, `CF_CLIENT_SECRET` | — | только если панель за Cloudflare Access |
+| `REMNAWAVE_API_TOKEN` | — | токен из панели |
+| `CF_CLIENT_ID`, `CF_CLIENT_SECRET` | — | если панель за Cloudflare Access |
 | `TRAFFIC_LIMIT_GB` | `100` | лимит трафика за окно |
 | `WINDOW_MINUTES` | `60` | размер скользящего окна |
 | `POLL_INTERVAL_SECONDS` | `300` | как часто опрашивать панель |
 | `CIRCUIT_BREAKER_MAX_USERS` | `5` | предохранитель: абсолютное число кандидатов |
 | `CIRCUIT_BREAKER_MAX_PERCENT` | `10` | предохранитель: % от активных пользователей |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | — | куда слать алерты (см. ниже) |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | — | алерты в Telegram |
+
+### API-токен
+
+1. Панель Remnawave → **Settings → API Tokens → Create**.
+2. Имя любое, например `remnawave-traffic-guard`.
+3. **Expiration (days)** — бессрочных токенов нет; поставьте большой срок
+   (например `365`) и пересоздайте до истечения, иначе сервис начнёт получать
+   `401` каждый цикл.
+4. Scope **`users`**: Read + Write. Больше ничего не включайте.
+5. Токен показывается **один раз** — сразу скопируйте в `.env`.
 
 ### Алерты в Telegram
 
-Задайте токен любого Telegram-бота и `TELEGRAM_CHAT_ID` — личный `chat_id`
-или id группы админов (узнать свой `chat_id` можно, написав
+Токен любого бота + `TELEGRAM_CHAT_ID` (личный или группы; узнать id можно у
 [@userinfobot](https://t.me/userinfobot)). Сервис только шлёт `sendMessage`.
-Если не задать — алерты будут только в лог контейнера.
+Если не задать — алерты только в лог контейнера.
 
-## 3. Деплой
+## Деплой (подробнее)
 
-Сервис рассчитан на отдельный контейнер с лимитами CPU/RAM.
-
-```bash
-git clone <url-репозитория> remnawave-traffic-guard
-cd remnawave-traffic-guard
-cp .env.example .env
-nano .env   # заполнить REMNAWAVE_URL / REMNAWAVE_API_TOKEN / TELEGRAM_*
-
-docker compose up -d --build
-```
-
-`docker-compose.yml` уже содержит лимиты:
+`docker-compose.yml` ограничивает ресурсы, чтобы сервис не мешал соседним
+процессам на хосте:
 
 ```yaml
 deploy:
@@ -131,15 +117,12 @@ deploy:
       memory: 150M
 ```
 
-Это Compose v2 — работает с обычным `docker compose up` без режима swarm. Если
-у вас старый `docker-compose` (v1, бинарник на Python) — он секцию `deploy`
-игнорирует, раскомментируйте в файле `mem_limit: 150m` / `cpus: 0.3` (это
-эквивалент для старого формата).
+Compose v2 понимает `deploy` без swarm. У старого `docker-compose` v1 секция
+игнорируется — раскомментируйте в файле `mem_limit: 150m` / `cpus: 0.3`.
 
-Том `./data` монтируется в контейнер, чтобы история окна и журнал действий
-переживали `docker compose restart`/обновление образа.
+Том `./data` хранит историю окна и журнал действий между рестартами.
 
-**Альтернатива — добавить как сервис в существующий `docker-compose.yml`:**
+**Как второй сервис в чужом `docker-compose.yml`:**
 
 ```yaml
   remnawave-traffic-guard:
@@ -157,96 +140,64 @@ deploy:
           memory: 150M
 ```
 
-**Альтернатива без Docker** (systemd): собрать `npm ci && npm run build`,
-запускать `node dist/index.js` юнитом с ограничением ресурсов через cgroups:
-
-```ini
-# /etc/systemd/system/remnawave-traffic-guard.service
-[Unit]
-Description=remnawave-traffic-guard
-After=network.target
-
-[Service]
-WorkingDirectory=/opt/remnawave-traffic-guard
-EnvironmentFile=/opt/remnawave-traffic-guard/.env
-ExecStart=/usr/bin/node dist/index.js
-Restart=on-failure
-MemoryMax=150M
-CPUQuota=30%
-Nice=10
-IOSchedulingClass=best-effort
-IOSchedulingPriority=7
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-systemctl daemon-reload
-systemctl enable --now remnawave-traffic-guard
-```
-
-## 4. Проверка после запуска
+## Проверка после запуска
 
 ```bash
 docker compose logs -f remnawave-traffic-guard
 ```
 
-Что смотреть:
-- `Прогон завершён` с `scannedTotal/scannedActive/candidates` — должно расти
-  `scannedTotal` на размер базы пользователей, `candidates` в норме — 0 или
-  около того.
-- `Пользователь отключён за превышение трафика` — если появляется для реально
-  "тяжёлых" пользователей (можно сверить вручную в панели по
-  `userId`/`username`), логика работает верно.
-- Если задан Telegram — отключения продублируются туда же одним сообщением
-  за проход.
-- Файл `data/actions.jsonl` — построчный журнал всех `disable`.
+- `Прогон завершён` с `scannedTotal/scannedActive/candidates` — панель
+  отвечает; `candidates` в норме обычно `0`.
+- `Пользователь отключён за превышение трафика` — срабатывание правила
+  (сверьте `userId`/`username` в панели).
+- Telegram — сводка за проход, если заданы токен и chat_id.
+- `data/actions.jsonl` — журнал всех `disable`.
 
-Имейте в виду: **полный час истории набирается не сразу**. Если контейнер
-только запущен, сервису нужно собрать точки, покрывающие весь
-`WINDOW_MINUTES` (по умолчанию 12 опросов по 5 минут ≈ час), прежде чем он
-начнёт оценивать прирост — это нормально, не баг.
+Первое время держите `CIRCUIT_BREAKER_MAX_USERS` небольшим (5 по умолчанию):
+лучше лишний алерт «предохранитель», чем массовое отключение из‑за сбоя
+счётчиков в панели.
 
-Рекомендация: первое время держите `CIRCUIT_BREAKER_MAX_USERS` небольшим
-(5 по умолчанию) — лучше лишний раз получить алерт "предохранитель сработал,
-проверь руками", чем массово отключить пользователей из-за, например,
-временного сбоя подсчёта трафика в самой панели.
-
-## 5. Как вернуть пользователя, если отключили по ошибке
-
-Самый быстрый способ — встроенная утилита (использует тот же API-клиент, что
-и основной сервис):
+## Вернуть пользователя
 
 ```bash
 docker compose exec remnawave-traffic-guard node dist/tools/unblockUser.js <userId>
-# или если без Docker:
-npm run unblock -- <userId>
 ```
 
-`<userId>` — числовой id пользователя Remnawave (не Telegram id!). Его можно
-найти:
-- в `data/actions.jsonl` — в записи с `"action":"disable"` для этого
-  пользователя (там же есть `telegramId`, чтобы сопоставить с человеком);
-- в самой панели — карточка пользователя.
+`<userId>` — числовой id Remnawave (не Telegram). Найти можно в
+`data/actions.jsonl` (`"action":"disable"`) или в карточке пользователя в
+панели.
 
-Утилита выведет статус до/после и допишет запись `"action":"enable"` в
-`actions.jsonl`.
-
-Без утилиты — то же самое напрямую через API панели:
+Или напрямую через API:
 
 ```bash
 curl -X POST "$REMNAWAVE_URL/api/users/<userId>/actions/enable" \
   -H "Authorization: Bearer $REMNAWAVE_API_TOKEN"
 ```
 
-(добавьте `-H "CF-Access-Client-Id: ..."` и `-H "CF-Access-Client-Secret: ..."`,
-если панель закрыта Cloudflare Access).
+(при Cloudflare Access добавьте заголовки `CF-Access-Client-Id` и
+`CF-Access-Client-Secret`).
 
 ## Безопасность токена
 
-`REMNAWAVE_API_TOKEN` даёт доступ на чтение списка/трафика пользователей и
-на их отключение/включение — храните `.env` с правами `600` и не кладите в
-git (`.gitignore` уже это учитывает). Токен ограничен scope `users:read` +
-`users:write` (шаг 1), так что даже при утечке он не даст доступа к нодам,
-другим настройкам панели или созданию новых админ-токенов.
+`REMNAWAVE_API_TOKEN` даёт чтение пользователей/трафика и
+disable/enable. Храните `.env` с правами `600`, не коммитьте в git
+(`.gitignore` уже исключает). Scope только `users:read` + `users:write` —
+при утечке нет доступа к нодам и настройкам панели.
+
+## Структура проекта
+
+```
+src/
+  config.ts          — чтение и валидация .env
+  env.ts             — мини-загрузчик .env
+  remnawaveClient.ts — HTTP-клиент панели
+  stateStore.ts       — скользящее окно на диске
+  trafficGuard.ts     — основной цикл
+  telegramNotifier.ts — алерты в Telegram
+  actionsLog.ts       — JSONL-журнал действий
+  tools/unblockUser.ts — CLI возврата пользователя
+  index.ts            — точка входа
+```
+
+Runtime-зависимостей нет (Node 20 `fetch`). В dev — `typescript` и
+`@types/node`.
