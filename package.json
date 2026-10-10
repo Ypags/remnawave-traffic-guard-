@@ -1,0 +1,22 @@
+{
+	"name": "remnawave-traffic-guard",
+	"version": "1.0.0",
+	"description": "Автоматически отключает пользователей Remnawave при превышении лимита трафика за скользящее окно",
+	"type": "module",
+	"main": "dist/index.js",
+	"private": true,
+	"scripts": {
+		"build": "tsc",
+		"start": "node dist/index.js",
+		"dev": "tsc --watch & node --watch dist/index.js",
+		"unblock": "node dist/tools/unblockUser.js"
+	},
+	"engines": {
+		"node": ">=20.0.0"
+	},
+	"dependencies": {},
+	"devDependencies": {
+		"@types/node": "^20.14.0",
+		"typescript": "^5.5.0"
+	}
+}

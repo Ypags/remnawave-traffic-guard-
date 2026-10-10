@@ -1,0 +1,20 @@
+services:
+  remnawave-traffic-guard:
+    build: .
+    container_name: remnawave-traffic-guard
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    # Лимиты CPU/RAM, чтобы сервис не мешал соседним процессам на том же хосте.
+    # Поддерживается docker compose v2 (Compose CLI) без режима swarm.
+    deploy:
+      resources:
+        limits:
+          cpus: '0.3'
+          memory: 150M
+    # Если используется старый docker-compose (v1, формат файла 2.x) и секция
+    # deploy игнорируется — раскомментируйте эквивалентные ключи ниже:
+    # mem_limit: 150m
+    # cpus: 0.3
